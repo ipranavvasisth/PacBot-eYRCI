@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """
-Task 1A: PacBot 2D Path Planning Implementation
+Task 1A: PacBot 2D Path Planning Implementation (v2)
+
+Changes from the original version:
+  1. NAVIGATION IS PRECOMPUTED ONCE AT STARTUP instead of re-running BFS
+     from scratch on every single MQTT tick. We run one BFS per maze cell
+     (169 total), each rooted at that cell as the "goal". Each BFS tree
+     gives us, for every other cell, both the distance to the goal and
+     the next hop to take toward it. After that one-time setup, picking
+     a move at runtime is an O(1) dictionary lookup per candidate pellet/
+     exit instead of a full graph search.
+  2. Deterministic tie-breaking: when two pellets are equally close, we
+     break the tie by cell coordinates instead of relying on Python set
+     iteration order (which was arbitrary and could cause target
+     thrashing).
+  3. Standing on an uncollected pellet (distance 0) now returns None
+     (wait) instead of silently falling through to the exit phase.
+  4. Out-of-bounds / post-exit poses are handled safely: the lookup
+     tables only ever contain valid maze cells as keys, so an
+     out-of-maze pose just fails a dict lookup instead of indexing
+     WALLS with a bad row/col (which could silently wrap around via
+     negative indexing or crash outright). A `finished` flag stops the
+     controller from doing further work once the bot has exited.
 """
 
 from collections import deque
@@ -11,7 +32,7 @@ import paho.mqtt.client as mqtt
 
 MAZE_ROWS = 13
 MAZE_COLS = 13
-MQTT_BROKER = "localhost" 
+MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 POSE_TOPIC = "robot/pose"
 
@@ -40,9 +61,9 @@ EXIT_CELLS = [
     (MAZE_ROWS - 1, 6, 'north'),
 ]
 
-BOT_CMD_TOPIC = "bot/cmd"         
-PELLETS_TOPIC = "pellets/pose"    
-CMD_VEL_TOPIC = "robot/cmd_vel"  
+BOT_CMD_TOPIC = "bot/cmd"
+PELLETS_TOPIC = "pellets/pose"
+CMD_VEL_TOPIC = "robot/cmd_vel"
 
 # yaw -> dr, dc, wall bit. 0=EAST, 90=NORTH, 180=WEST, 270=SOUTH
 HEADING_DELTA = {
@@ -61,8 +82,13 @@ FACING_TO_YAW = {
 
 
 # ============================================================================
-# GRAPH UTILITIES & SEARCH
+# GRAPH UTILITIES
 # ============================================================================
+def in_bounds(cell):
+    r, c = cell
+    return 0 <= r < MAZE_ROWS and 0 <= c < MAZE_COLS
+
+
 def get_neighbors(cell):
     """Returns valid accessible neighbor cells from the bitmask WALLS table."""
     r, c = cell
@@ -72,31 +98,47 @@ def get_neighbors(cell):
     for yaw, (dr, dc, wall_bit) in HEADING_DELTA.items():
         if not (cell_walls & wall_bit):
             nr, nc = r + dr, c + dc
-            if 0 <= nr < MAZE_ROWS and 0 <= nc < MAZE_COLS:
+            if in_bounds((nr, nc)):
                 neighbors.append((nr, nc))
     return neighbors
 
 
-def bfs_shortest_path(start, goal):
-    """Standard BFS shortest path from start cell to goal cell."""
-    if start == goal:
-        return [start]
-    
-    queue = deque([[start]])
-    visited = {start}
+def precompute_navigation():
+    """
+    Run one BFS per maze cell, treating that cell as the goal. This is the
+    core change: instead of re-searching the graph on every tick, we build
+    two lookup tables once, at startup:
 
-    while queue:
-        path = queue.popleft()
-        current = path[-1]
+      DIST[goal][cell]  -> shortest distance from `cell` to `goal`
+      NEXT[goal][cell]  -> the neighbor to step into from `cell` when
+                            heading toward `goal`
 
-        if current == goal:
-            return path
+    Both are O(1) dict lookups at runtime. Cost of building them is
+    169 BFS runs over a 169-cell graph -- trivial, and only ever paid once.
 
-        for neighbor in get_neighbors(current):
-            if neighbor not in visited:
-                visited.add(neighbor)
-                queue.append(path + [neighbor])
-    return None
+    Assumes walls are symmetric (a wall between two cells blocks movement
+    in both directions), which is the standard convention for this kind
+    of bitmask maze representation.
+    """
+    all_cells = [(r, c) for r in range(MAZE_ROWS) for c in range(MAZE_COLS)]
+    dist_tables = {}
+    next_tables = {}
+
+    for goal in all_cells:
+        dist = {goal: 0}
+        parent = {}
+        queue = deque([goal])
+        while queue:
+            current = queue.popleft()
+            for neighbor in get_neighbors(current):
+                if neighbor not in dist:
+                    dist[neighbor] = dist[current] + 1
+                    parent[neighbor] = current
+                    queue.append(neighbor)
+        dist_tables[goal] = dist
+        next_tables[goal] = parent  # parent[cell] == next hop toward goal
+
+    return dist_tables, next_tables
 
 
 def get_required_yaw(from_cell, to_cell):
@@ -130,50 +172,57 @@ def turn_command_needed(current_yaw, target_yaw):
 # ============================================================================
 # YOUR ALGORITHM GOES HERE. Everything above and below is plumbing.
 # ============================================================================
-def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
+def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining, dist_table, next_table):
     """FRONT/LEFT/RIGHT/BACK to send now, or None. pacbot_cell=(row,col),
     pacbot_yaw one of HEADING_DELTA's keys, pellets_remaining=set of
-    (row,col)."""
+    (row,col). dist_table/next_table come from precompute_navigation()."""
 
     # --- 1. PELLET COLLECTION PHASE ---
     if pellets_remaining:
-        # Find the shortest path to any remaining pellet
-        best_path = None
+        candidates = []
         for pellet in pellets_remaining:
-            path = bfs_shortest_path(pacbot_cell, pellet)
-            if path and (best_path is None or len(path) < len(best_path)):
-                best_path = path
+            d = dist_table.get(pellet, {}).get(pacbot_cell)
+            if d is not None:
+                candidates.append((d, pellet))
 
-        if best_path and len(best_path) > 1:
-            next_cell = best_path[1]
+        if candidates:
+            # Deterministic tie-break: distance first, then cell coords --
+            # not left up to arbitrary set-iteration order.
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            best_dist, best_pellet = candidates[0]
+
+            if best_dist == 0:
+                # Already standing on the nearest pellet -- wait for the
+                # external pellet-collection confirmation instead of
+                # moving on before it's registered.
+                return None
+
+            next_cell = next_table[best_pellet][pacbot_cell]
             req_yaw = get_required_yaw(pacbot_cell, next_cell)
             if req_yaw is not None:
                 return turn_command_needed(pacbot_yaw, req_yaw)
 
     # --- 2. MAZE EXIT PHASE ---
-    # Find the nearest exit cell among the 2 known exits
-    best_exit_path = None
-    chosen_exit = None
-
+    exit_candidates = []
     for exit_row, exit_col, facing in EXIT_CELLS:
         exit_cell = (exit_row, exit_col)
-        path = bfs_shortest_path(pacbot_cell, exit_cell)
-        if path and (best_exit_path is None or len(path) < len(best_exit_path)):
-            best_exit_path = path
-            chosen_exit = (exit_row, exit_col, facing)
+        d = dist_table.get(exit_cell, {}).get(pacbot_cell)
+        if d is not None:
+            exit_candidates.append((d, exit_cell, facing))
 
-    if best_exit_path:
-        # Still navigating towards the exit cell
-        if len(best_exit_path) > 1:
-            next_cell = best_exit_path[1]
+    if exit_candidates:
+        exit_candidates.sort(key=lambda x: (x[0], x[1]))
+        best_dist, exit_cell, facing = exit_candidates[0]
+
+        if best_dist > 0:
+            next_cell = next_table[exit_cell][pacbot_cell]
             req_yaw = get_required_yaw(pacbot_cell, next_cell)
             if req_yaw is not None:
                 return turn_command_needed(pacbot_yaw, req_yaw)
 
-        # Bot has reached the exit cell; align and step out of the maze
-        if pacbot_cell == (chosen_exit[0], chosen_exit[1]):
-            exit_target_yaw = FACING_TO_YAW[chosen_exit[2]]
-            return turn_command_needed(pacbot_yaw, exit_target_yaw)
+        # Bot has reached the exit cell; align and step out of the maze.
+        exit_target_yaw = FACING_TO_YAW[facing]
+        return turn_command_needed(pacbot_yaw, exit_target_yaw)
 
     return None
 # ============================================================================
@@ -184,6 +233,9 @@ def parse_pellets(payload):
 
 
 def main():
+    # One-time precompute -- replaces per-tick BFS.
+    dist_table, next_table = precompute_navigation()
+
     state = {
         "running": False,
         "pellets": set(),
@@ -192,16 +244,18 @@ def main():
         "in_flight": False,
         "got_pose": False,
         "got_pellets": False,
+        "finished": False,
     }
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="Controller")
 
     def decide_and_send():
-        if (not state["running"] or state["in_flight"]
+        if (not state["running"] or state["in_flight"] or state["finished"]
                 or not state["got_pose"] or not state["got_pellets"]):
             return
         print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")
-        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))
+        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]),
+                              dist_table, next_table)
         if cmd is not None:
             state["in_flight"] = True
             client.publish(CMD_VEL_TOPIC, cmd)
@@ -222,11 +276,22 @@ def main():
                 decide_and_send()
             elif msg.topic == POSE_TOPIC:
                 data = json.loads(msg.payload.decode())
-                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped
-                state["got_pose"] = True
+                cell = (int(data["col"]), int(data["row"]))   # wire is swapped
                 state["yaw"] = float(data.get("yaw", 0.0))
                 state["in_flight"] = False   # this pose is the ack for our last command
-                decide_and_send()   # every pose/command-ack triggers the next step
+
+                if in_bounds(cell):
+                    state["cell"] = cell
+                    state["got_pose"] = True
+                    decide_and_send()   # every pose/command-ack triggers the next step
+                else:
+                    # Bot has stepped outside the maze grid -- nothing left
+                    # to plan. Stop issuing commands instead of indexing
+                    # WALLS with an out-of-range row/col.
+                    if not state["finished"]:
+                        print(f"[controller] pose {cell} is outside the maze "
+                              f"-- treating as exit complete, stopping.")
+                    state["finished"] = True
         except Exception as e:
             print("[controller] mqtt parse error:", e)
 
@@ -240,7 +305,7 @@ def main():
 
     try:
         while True:
-            time.sleep(0.2)  
+            time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
